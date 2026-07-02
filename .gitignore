@@ -1,0 +1,29 @@
+# ==========================================
+# Biohub Competition Data (CRITICAL - DO NOT TRACK)
+# ==========================================
+data/
+*.zarr/
+*.geff/
+*.csv
+
+# ==========================================
+# Python & Environment Virtualization
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# ==========================================
+# Jupyter Notebooks Checkpoints
+# ==========================================
+.ipynb_checkpoints/
+
+# ==========================================
+# OS Generated Files
+# ==========================================
+.DS_Store
+Thumbs.db
