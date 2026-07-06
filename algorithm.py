@@ -35,7 +35,8 @@ import networkx as nx
 # Kaggle Environment Configuration
 # ============================================================================
 # Detect if running in Kaggle environment or local data folder
-if os.path.exists('/kaggle/input'):
+# Check if actual data directory exists, not just base input path
+if os.path.exists('/kaggle/input/biohub-cell-tracking-during-development/test'):
     INPUT_DIR = "/kaggle/input/biohub-cell-tracking-during-development/test"
     OUTPUT_PATH = "submission.csv"
 else:
