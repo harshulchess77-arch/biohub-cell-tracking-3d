@@ -101,6 +101,59 @@ class EmbryoSplitEvaluator:
         return jaccard
     
     @staticmethod
+    def detect_divisions_from_edges(edges: np.ndarray, nodes: np.ndarray) -> set:
+        """
+        Detect cell division events from tracking results.
+        A division occurs when one parent cell links to two or more daughter cells.
+        
+        Args:
+            edges: Array of edge connections [source_id, target_id]
+            nodes: Array of node coordinates [t, z, y, x]
+            
+        Returns:
+            Set of division events (parent_node_id)
+        """
+        if len(edges) == 0:
+            return set()
+        
+        # Count outgoing edges per node
+        from collections import defaultdict
+        outgoing_count = defaultdict(int)
+        
+        for source_id, target_id in edges:
+            outgoing_count[source_id] += 1
+        
+        # Divisions are nodes with 2+ outgoing edges (parent splits into daughters)
+        divisions = {node_id for node_id, count in outgoing_count.items() if count >= 2}
+        
+        return divisions
+    
+    @staticmethod
+    def extract_divisions_from_graph(edges: set, nodes: np.ndarray) -> set:
+        """
+        Extract division events from edge set for evaluation.
+        
+        Args:
+            edges: Set of edge tuples (source_id, target_id)
+            nodes: Node coordinates for temporal validation
+            
+        Returns:
+            Set of division parent IDs
+        """
+        if not edges:
+            return set()
+        
+        # Build adjacency to find nodes with multiple children
+        children_count = defaultdict(int)
+        for source, target in edges:
+            children_count[source] += 1
+        
+        # Division = parent with 2+ children
+        divisions = {node_id for node_id, count in children_count.items() if count >= 2}
+        
+        return divisions
+    
+    @staticmethod
     def compute_division_jaccard(pred_divisions: set, true_divisions: set) -> float:
         """
         Compute Jaccard index for division events (cell splits).

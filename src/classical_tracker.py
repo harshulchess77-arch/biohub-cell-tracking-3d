@@ -37,6 +37,8 @@ class AnisotropicDoGTracker:
     Classical cell tracker using Difference-of-Gaussians peak detection with
     anisotropic scaling for microscopy voxel dimensions and Hungarian algorithm
     for temporal linking.
+    
+    Supports multi-scale DoG for robust peak detection across different cell sizes.
     """
     
     # Physical voxel dimensions in micrometers (µm)
@@ -48,7 +50,8 @@ class AnisotropicDoGTracker:
     MAX_DISTANCE_THRESHOLD = 8.0  # 8.0 µm
     
     def __init__(self, sigma_small: float = 1.0, sigma_large: float = 3.0, 
-                 threshold: float = 0.5, min_distance: int = 5):
+                 threshold: float = 0.5, min_distance: int = 5,
+                 multi_scale: bool = True, sigma_range: List[float] = None):
         """
         Initialize the DoG tracker.
         
@@ -57,11 +60,15 @@ class AnisotropicDoGTracker:
             sigma_large: Large sigma for DoG (detects background)
             threshold: Detection threshold for peak finding
             min_distance: Minimum pixel distance between peaks
+            multi_scale: Enable multi-scale DoG for robust detection
+            sigma_range: List of sigma values for multi-scale detection
         """
         self.sigma_small = sigma_small
         self.sigma_large = sigma_large
         self.threshold = threshold
         self.min_distance = min_distance
+        self.multi_scale = multi_scale
+        self.sigma_range = sigma_range if sigma_range else [0.8, 1.0, 1.2, 1.5, 2.0]
         
     def _apply_anisotropic_scaling(self, volume: np.ndarray) -> np.ndarray:
         """
@@ -125,6 +132,21 @@ class AnisotropicDoGTracker:
         Returns:
             Array of detected peak coordinates [z, y, x]
         """
+        if self.multi_scale:
+            return self.detect_peaks_multiscale_dog(volume)
+        else:
+            return self.detect_peaks_single_scale_dog(volume)
+    
+    def detect_peaks_single_scale_dog(self, volume: np.ndarray) -> np.ndarray:
+        """
+        Detect peaks using single-scale Difference-of-Gaussians.
+        
+        Args:
+            volume: 3D volume array [Z, Y, X]
+            
+        Returns:
+            Array of detected peak coordinates [z, y, x]
+        """
         # Apply Difference-of-Gaussians
         dog = difference_of_gaussians(volume, self.sigma_small, self.sigma_large)
         
@@ -134,11 +156,8 @@ class AnisotropicDoGTracker:
         # Find peaks above threshold
         threshold_mask = dog_norm > self.threshold
         
-        # Simple local maximum detection (can be improved with more sophisticated methods)
-        peaks = []
+        # Local maximum detection
         from scipy.ndimage import maximum_filter
-        
-        # Local maximum filter
         local_max = maximum_filter(dog_norm, size=self.min_distance) == dog_norm
         
         # Combine threshold and local maximum
@@ -148,6 +167,77 @@ class AnisotropicDoGTracker:
         peak_coords = np.argwhere(peak_mask)
         
         return peak_coords
+    
+    def detect_peaks_multiscale_dog(self, volume: np.ndarray) -> np.ndarray:
+        """
+        Detect peaks using multi-scale Difference-of-Gaussians for robust detection
+        across different cell sizes.
+        
+        Args:
+            volume: 3D volume array [Z, Y, X]
+            
+        Returns:
+            Array of detected peak coordinates [z, y, x]
+        """
+        all_peaks = []
+        
+        for sigma in self.sigma_range:
+            # Apply DoG with current sigma
+            dog = difference_of_gaussians(volume, sigma, sigma * 3)
+            
+            # Normalize
+            dog_norm = (dog - dog.min()) / (dog.max() - dog.min() + 1e-8)
+            
+            # Threshold
+            threshold_mask = dog_norm > self.threshold
+            
+            # Local maximum
+            from scipy.ndimage import maximum_filter
+            local_max = maximum_filter(dog_norm, size=self.min_distance) == dog_norm
+            
+            peak_mask = threshold_mask & local_max
+            peak_coords = np.argwhere(peak_mask)
+            
+            all_peaks.append(peak_coords)
+        
+        # Merge peaks from all scales and remove duplicates
+        if all_peaks:
+            combined_peaks = np.vstack(all_peaks)
+            
+            # Remove duplicates within min_distance
+            unique_peaks = self._remove_duplicate_peaks(combined_peaks)
+            return unique_peaks
+        else:
+            return np.array([])
+    
+    def _remove_duplicate_peaks(self, peaks: np.ndarray) -> np.ndarray:
+        """
+        Remove duplicate peaks within min_distance.
+        
+        Args:
+            peaks: Array of peak coordinates [N, 3]
+            
+        Returns:
+            Array of unique peak coordinates
+        """
+        if len(peaks) == 0:
+            return peaks
+        
+        # Sort by intensity (not available here, so just use spatial clustering)
+        # Simple approach: keep first peak within min_distance
+        from scipy.spatial.distance import pdist, squareform
+        
+        distances = squareform(pdist(peaks))
+        keep = np.ones(len(peaks), dtype=bool)
+        
+        for i in range(len(peaks)):
+            if keep[i]:
+                # Mark nearby peaks as duplicates
+                nearby = distances[i] < self.min_distance
+                nearby[i] = False  # Don't mark self
+                keep[nearby] = False
+        
+        return peaks[keep]
     
     def detect_peaks_frame(self, volume_frame: np.ndarray) -> np.ndarray:
         """
