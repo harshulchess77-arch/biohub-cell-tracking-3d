@@ -197,6 +197,96 @@ class EmbryoSplitEvaluator:
         }
 
 
+def run_unit_tests():
+    """Run comprehensive unit tests for evaluation metrics."""
+    print("\n=== RUNNING UNIT TESTS ===\n")
+    
+    evaluator = EmbryoSplitEvaluator()
+    
+    # Test 1: Perfect edge matching
+    print("Test 1: Perfect edge matching")
+    pred_edges = {(1, 2), (2, 3), (3, 4)}
+    true_edges = {(1, 2), (2, 3), (3, 4)}
+    jaccard = evaluator.compute_edge_jaccard(pred_edges, true_edges)
+    assert abs(jaccard - 1.0) < 1e-6, f"Expected 1.0, got {jaccard}"
+    print(f"  ✓ Perfect match Jaccard: {jaccard:.4f}")
+    
+    # Test 2: No edge matching
+    print("\nTest 2: No edge matching")
+    pred_edges = {(1, 2), (3, 4)}
+    true_edges = {(5, 6), (7, 8)}
+    jaccard = evaluator.compute_edge_jaccard(pred_edges, true_edges)
+    assert abs(jaccard - 0.0) < 1e-6, f"Expected 0.0, got {jaccard}"
+    print(f"  ✓ No match Jaccard: {jaccard:.4f}")
+    
+    # Test 3: Partial edge matching
+    print("\nTest 3: Partial edge matching")
+    pred_edges = {(1, 2), (2, 3), (3, 4), (4, 5)}
+    true_edges = {(1, 2), (2, 3), (5, 6)}
+    jaccard = evaluator.compute_edge_jaccard(pred_edges, true_edges)
+    # Union = {(1,2), (2,3), (3,4), (4,5), (5,6)} = 5, Intersection = {(1,2), (2,3)} = 2
+    expected = 2.0 / 5.0
+    assert abs(jaccard - expected) < 1e-6, f"Expected {expected}, got {jaccard}"
+    print(f"  ✓ Partial match Jaccard: {jaccard:.4f} (expected: {expected:.4f})")
+    
+    # Test 4: Empty ground truth
+    print("\nTest 4: Empty ground truth edges")
+    pred_edges = {(1, 2)}
+    true_edges = set()
+    jaccard = evaluator.compute_edge_jaccard(pred_edges, true_edges)
+    assert abs(jaccard - 0.0) < 1e-6, f"Expected 0.0, got {jaccard}"
+    print(f"  ✓ Empty GT Jaccard: {jaccard:.4f}")
+    
+    # Test 5: Empty prediction
+    print("\nTest 5: Empty prediction edges")
+    pred_edges = set()
+    true_edges = {(1, 2)}
+    jaccard = evaluator.compute_edge_jaccard(pred_edges, true_edges)
+    assert abs(jaccard - 0.0) < 1e-6, f"Expected 0.0, got {jaccard}"
+    print(f"  ✓ Empty pred Jaccard: {jaccard:.4f}")
+    
+    # Test 6: Division Jaccard
+    print("\nTest 6: Division Jaccard")
+    pred_divs = {1, 2}
+    true_divs = {1, 3}
+    jaccard = evaluator.compute_division_jaccard(pred_divs, true_divs)
+    # Union = {1,2,3} = 3, Intersection = {1} = 1
+    expected = 1.0 / 3.0
+    assert abs(jaccard - expected) < 1e-6, f"Expected {expected}, got {jaccard}"
+    print(f"  ✓ Division Jaccard: {jaccard:.4f} (expected: {expected:.4f})")
+    
+    # Test 7: Competition score bounds
+    print("\nTest 7: Competition score bounds")
+    # Perfect score
+    score = evaluator.compute_competition_score(
+        np.array([[0, 1, 2, 3]]), np.array([[0, 1, 2, 3]]),
+        {(1, 2)}, {(1, 2)}, {1}, {1}
+    )
+    assert score <= 1.0, f"Score should be ≤ 1.0, got {score}"
+    assert score >= 0.0, f"Score should be ≥ 0.0, got {score}"
+    print(f"  ✓ Perfect score: {score:.4f}")
+    
+    # Zero score
+    score = evaluator.compute_competition_score(
+        np.array([[0, 1, 2, 3]]), np.array([[0, 1, 2, 3]]),
+        {(1, 2)}, {(3, 4)}, {1}, {2}
+    )
+    assert score >= 0.0, f"Score should be ≥ 0.0, got {score}"
+    print(f"  ✓ Zero score: {score:.4f}")
+    
+    # Test 8: Edge permutation invariance
+    print("\nTest 8: Edge permutation invariance")
+    pred_edges_1 = {(1, 2), (2, 3)}
+    pred_edges_2 = {(2, 3), (1, 2)}
+    true_edges = {(1, 2), (2, 3)}
+    jaccard_1 = evaluator.compute_edge_jaccard(pred_edges_1, true_edges)
+    jaccard_2 = evaluator.compute_edge_jaccard(pred_edges_2, true_edges)
+    assert abs(jaccard_1 - jaccard_2) < 1e-6, f"Jaccard should be permutation invariant"
+    print(f"  ✓ Permutation invariance: {jaccard_1:.4f} == {jaccard_2:.4f}")
+    
+    print("\n=== ALL UNIT TESTS PASSED ===\n")
+
+
 if __name__ == "__main__":
     print("--- BioHub Cross-Validation Engine Test ---")
     
@@ -208,6 +298,9 @@ if __name__ == "__main__":
     
     for i, (train, val) in enumerate(splits):
         print(f"Fold {i+1}: Train={len(train)}, Val={len(val)}")
+    
+    # Run unit tests
+    run_unit_tests()
     
     # Test scoring
     pred_edges = {(1, 2), (2, 3), (3, 4)}

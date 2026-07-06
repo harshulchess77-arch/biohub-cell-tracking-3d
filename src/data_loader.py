@@ -149,6 +149,13 @@ class CellTrackingDataset(Dataset):
         volume = volume * scale
         return volume
     
+    def _add_intensity_noise(self, volume: np.ndarray) -> np.ndarray:
+        """Add uniform intensity noise injection."""
+        noise = np.random.uniform(-0.02, 0.02, volume.shape).astype(np.float32)
+        volume = volume + noise
+        volume = np.clip(volume, 0, 1)
+        return volume
+    
     def _normalize_volume(self, volume: np.ndarray) -> np.ndarray:
         """Normalize volume to [0, 1] range."""
         volume = volume.astype(np.float32)
@@ -251,6 +258,7 @@ class CellTrackingDataset(Dataset):
             heatmap = self._random_flip_z(heatmap)
             
             crop = self._random_intensity_scale(crop)
+            crop = self._add_intensity_noise(crop)
         
         # Convert to tensors
         crop_tensor = torch.from_numpy(crop).unsqueeze(0).float()  # Add channel dim
