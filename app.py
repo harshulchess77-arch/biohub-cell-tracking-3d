@@ -230,6 +230,49 @@ if selected_dataset:
                             hovertemplate="Node ID: %{fullData.name}<br>X: %{x:.1f}<br>Y: %{y:.1f}<extra></extra>"
                         ))
             
+            # Add tracking results with error markers if available
+            if 'tracking_nodes' in st.session_state:
+                tracking_nodes = st.session_state['tracking_nodes']
+                tracking_edges = st.session_state['tracking_edges']
+                
+                # Identify tracking conflicts (nodes with no edges in current frame)
+                current_tracking_nodes = tracking_nodes[tracking_nodes[:, 0] == t_idx]
+                
+                # Create node ID mapping for edge checking
+                node_id_map = {}
+                for idx, node in enumerate(tracking_nodes):
+                    node_id_map[idx] = node
+                
+                # Check for tracking conflicts (nodes with no incoming/outgoing edges)
+                if len(tracking_edges) > 0:
+                    edge_sources = set(tracking_edges[:, 0])
+                    edge_targets = set(tracking_edges[:, 1])
+                    
+                    for idx, node in enumerate(current_tracking_nodes):
+                        node_z, node_y, node_x = node[1], node[2], node[3]
+                        if abs(node_z - z_idx) <= 2:
+                            # Check if this node has tracking conflicts
+                            has_conflict = (idx not in edge_sources and idx not in edge_targets)
+                            
+                            if has_conflict:
+                                # Mark as error (red)
+                                fig_xy.add_trace(go.Scatter(
+                                    x=[node_x], y=[node_y],
+                                    mode="markers",
+                                    marker=dict(size=12, color="#ff4757", line=dict(width=2, color="#e6edf3"), symbol="x"),
+                                    name=f"Conflict Node {idx}",
+                                    hovertemplate=f"Tracking Conflict: Node {idx}<br>X: %{x:.1f}<br>Y: %{y:.1f}<extra></extra>"
+                                ))
+                            else:
+                                # Normal tracking (green)
+                                fig_xy.add_trace(go.Scatter(
+                                    x=[node_x], y=[node_y],
+                                    mode="markers",
+                                    marker=dict(size=8, color="#3fb950", line=dict(width=1, color="#e6edf3")),
+                                    name=f"Tracked Node {idx}",
+                                    hovertemplate=f"Tracked Node: {idx}<br>X: %{x:.1f}<br>Y: %{y:.1f}<extra></extra>"
+                                ))
+            
             st.plotly_chart(fig_xy, width="stretch")
         
         with col2:
@@ -473,10 +516,18 @@ if evaluate_btn and selected_dataset and evaluator:
             tracking_results = tracker.track_volume(volume)
             nodes_pred = tracking_results['nodes']
             edges_pred = tracking_results['edges']
+            sanitization_messages = tracking_results.get('sanitization_messages', [])
             
             # Detect divisions
             divisions = evaluator.detect_divisions_from_edges(edges_pred, nodes_pred)
+            
             st.success(f"Detected {len(nodes_pred)} centroids, {len(edges_pred)} links, {len(divisions)} divisions")
+            
+            # Display sanitization messages
+            if sanitization_messages:
+                st.info("Graph Sanitization Applied:")
+                for msg in sanitization_messages:
+                    st.caption(f"• {msg}")
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model = CellTrackerUNet3D().to(device)
@@ -486,11 +537,13 @@ if evaluate_btn and selected_dataset and evaluator:
             nodes_pred = nodes
             edges_pred = edges if edges is not None else np.empty((0, 2))
             divisions = evaluator.detect_divisions_from_edges(edges_pred, nodes_pred)
+            sanitization_messages = []
             st.success(f"Deep Learning inference complete: {len(nodes_pred)} nodes, {len(edges_pred)} edges, {len(divisions)} divisions")
         
         st.session_state['tracking_nodes'] = nodes_pred
         st.session_state['tracking_edges'] = edges_pred
         st.session_state['tracking_divisions'] = divisions
+        st.session_state['tracking_sanitization_messages'] = sanitization_messages
         st.rerun()
 
 # Export Logic
@@ -498,20 +551,22 @@ if export_btn and selected_dataset:
     if 'tracking_nodes' in st.session_state:
         export_nodes = st.session_state['tracking_nodes']
         export_edges = st.session_state['tracking_edges']
+        sanitization_messages = st.session_state.get('tracking_sanitization_messages', [])
     elif has_graph:
         export_nodes = nodes
         export_edges = edges if edges is not None else np.empty((0, 2))
+        sanitization_messages = []
     else:
         st.warning("No tracking results available. Run analysis first.")
         export_nodes = None
     
     if export_nodes is not None:
-        # Kaggle-compliant export
+        # Kaggle-compliant export with proper padding
         sub_records = []
         dataset_id = selected_dataset.replace(".zarr", "")
         row_id = 0
         
-        # Node rows
+        # Node rows: coordinates populated, source/target padded with -1
         for idx, node in enumerate(export_nodes):
             t, z, y, x = node
             sub_records.append({
@@ -523,23 +578,23 @@ if export_btn and selected_dataset:
                 "z": float(z),
                 "y": float(y),
                 "x": float(x),
-                "source_id": -1,
-                "target_id": -1
+                "source_id": -1,  # Padded for node rows
+                "target_id": -1   # Padded for node rows
             })
             row_id += 1
         
-        # Edge rows
+        # Edge rows: source/target populated, coordinates padded with -1
         for edge in export_edges:
             source_id, target_id = edge
             sub_records.append({
                 "id": row_id,
                 "dataset": dataset_id,
                 "row_type": "edge",
-                "node_id": -1,
-                "t": -1,
-                "z": -1.0,
-                "y": -1.0,
-                "x": -1.0,
+                "node_id": -1,      # Padded for edge rows
+                "t": -1,           # Padded for edge rows
+                "z": -1.0,         # Padded for edge rows
+                "y": -1.0,         # Padded for edge rows
+                "x": -1.0,         # Padded for edge rows
                 "source_id": int(source_id),
                 "target_id": int(target_id)
             })
@@ -548,6 +603,13 @@ if export_btn and selected_dataset:
         sub_df = pd.DataFrame(sub_records)
         sub_df.to_csv("submission.csv", index=False)
         st.success(f"Exported {len(sub_df)} rows to submission.csv")
+        
+        # Display sanitization messages if any
+        if sanitization_messages:
+            st.info("Graph Sanitization Applied:")
+            for msg in sanitization_messages:
+                st.caption(f"• {msg}")
+        
         st.dataframe(sub_df.head(20))
         
         # Add download button

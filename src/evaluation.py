@@ -204,7 +204,7 @@ class EmbryoSplitEvaluator:
             pred_divisions, true_divisions
         )
         
-        # Competition formula
+        # Competition formula: adjusted_edge_jaccard + 0.1 * division_jaccard
         score = edge_jaccard + 0.1 * division_jaccard
         
         return score
