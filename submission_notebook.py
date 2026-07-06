@@ -160,13 +160,14 @@ def link_frames_hungarian(frame1_peaks: np.ndarray, frame2_peaks: np.ndarray) ->
 
 def sanitize_graph(edges: np.ndarray, nodes: np.ndarray) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
-    Implement graph hygiene sanitization to remove structurally impossible graph defects.
+    Implement comprehensive graph hygiene sanitization to remove structurally impossible graph defects.
     
     Removes:
     - Multi-parent nodes (a cell can only have 1 parent)
     - Self-looping edges
     - Edges connecting non-consecutive timesteps
     - Duplicate edge declarations
+    - Invalid node references in edges
     
     Args:
         edges: Array of edge connections [source_id, target_id]
@@ -177,8 +178,14 @@ def sanitize_graph(edges: np.ndarray, nodes: np.ndarray) -> Tuple[np.ndarray, np
     """
     error_messages = []
     
+    # Empty frame guard: return early if no edges
     if len(edges) == 0:
         return edges, nodes, error_messages
+    
+    # Empty frame guard: return early if no nodes
+    if len(nodes) == 0:
+        error_messages.append("WARNING: No nodes available for edge validation")
+        return np.empty((0, 2)), nodes, error_messages
     
     # Create node time mapping
     node_times = {}
@@ -186,11 +193,33 @@ def sanitize_graph(edges: np.ndarray, nodes: np.ndarray) -> Tuple[np.ndarray, np
         t, z, y, x = node
         node_times[idx] = t
     
+    # Filter 0: Remove edges with invalid node references
+    valid_node_refs = []
+    invalid_ref_count = 0
+    for edge in edges:
+        source_id, target_id = edge
+        if source_id in node_times and target_id in node_times:
+            valid_node_refs.append(edge)
+        else:
+            invalid_ref_count += 1
+    
+    if invalid_ref_count > 0:
+        error_messages.append(f"Removed {invalid_ref_count} edges with invalid node references")
+    edges = np.array(valid_node_refs) if valid_node_refs else np.empty((0, 2))
+    
+    # Return early if no valid edges remain
+    if len(edges) == 0:
+        return edges, nodes, error_messages
+    
     # Filter 1: Remove self-loops
     self_loops = edges[:, 0] == edges[:, 1]
     if np.any(self_loops):
         error_messages.append(f"Removed {np.sum(self_loops)} self-looping edges")
         edges = edges[~self_loops]
+    
+    # Return early if no edges remain
+    if len(edges) == 0:
+        return edges, nodes, error_messages
     
     # Filter 2: Remove edges connecting non-consecutive timesteps
     valid_edges = []
@@ -210,53 +239,58 @@ def sanitize_graph(edges: np.ndarray, nodes: np.ndarray) -> Tuple[np.ndarray, np
         error_messages.append(f"Removed {non_consecutive_count} non-consecutive timestep edges")
     edges = np.array(valid_edges) if valid_edges else np.empty((0, 2))
     
+    # Return early if no edges remain
+    if len(edges) == 0:
+        return edges, nodes, error_messages
+    
     # Filter 3: Remove multi-parent nodes (keep only the closest parent)
-    if len(edges) > 0:
-        # Count incoming edges per node
-        incoming_count = defaultdict(list)
-        for idx, edge in enumerate(edges):
-            target_id = edge[1]
-            incoming_count[target_id].append(idx)
-        
-        # For nodes with multiple parents, keep only the closest one
-        edges_to_remove = set()
-        for target_id, edge_indices in incoming_count.items():
-            if len(edge_indices) > 1:
-                # Find the edge with smallest physical distance
-                if target_id in node_times:
-                    distances = []
-                    for edge_idx in edge_indices:
-                        source_id = edges[edge_idx][0]
-                        if source_id in node_times:
-                            # Calculate physical distance
-                            source_node = nodes[source_id]
-                            target_node = nodes[target_id]
-                            
-                            # Physical distance in µm
-                            dz = (source_node[1] - target_node[1]) * VOXEL_SIZE_Z
-                            dy = (source_node[2] - target_node[2]) * VOXEL_SIZE_Y
-                            dx = (source_node[3] - target_node[3]) * VOXEL_SIZE_X
-                            dist = np.sqrt(dz**2 + dy**2 + dx**2)
-                            distances.append((dist, edge_idx))
-                    
-                    if distances:
-                        # Sort by distance and keep only the closest
-                        distances.sort(key=lambda x: x[0])
-                        # Remove all except the first (closest)
-                        for _, edge_idx in distances[1:]:
-                            edges_to_remove.add(edge_idx)
-        
-        if edges_to_remove:
-            error_messages.append(f"Removed {len(edges_to_remove)} multi-parent edges (kept closest parent)")
-            keep_mask = np.array([i not in edges_to_remove for i in range(len(edges))])
-            edges = edges[keep_mask]
+    incoming_count = defaultdict(list)
+    for idx, edge in enumerate(edges):
+        target_id = edge[1]
+        incoming_count[target_id].append(idx)
+    
+    # For nodes with multiple parents, keep only the closest one
+    edges_to_remove = set()
+    for target_id, edge_indices in incoming_count.items():
+        if len(edge_indices) > 1:
+            # Find the edge with smallest physical distance
+            if target_id in node_times:
+                distances = []
+                for edge_idx in edge_indices:
+                    source_id = edges[edge_idx][0]
+                    if source_id in node_times:
+                        # Calculate physical distance
+                        source_node = nodes[source_id]
+                        target_node = nodes[target_id]
+                        
+                        # Physical distance in µm
+                        dz = (source_node[1] - target_node[1]) * VOXEL_SIZE_Z
+                        dy = (source_node[2] - target_node[2]) * VOXEL_SIZE_Y
+                        dx = (source_node[3] - target_node[3]) * VOXEL_SIZE_X
+                        dist = np.sqrt(dz**2 + dy**2 + dx**2)
+                        distances.append((dist, edge_idx))
+                
+                if distances:
+                    # Sort by distance and keep only the closest
+                    distances.sort(key=lambda x: x[0])
+                    # Remove all except the first (closest)
+                    for _, edge_idx in distances[1:]:
+                        edges_to_remove.add(edge_idx)
+    
+    if edges_to_remove:
+        error_messages.append(f"Removed {len(edges_to_remove)} multi-parent edges (kept closest parent)")
+        keep_mask = np.array([i not in edges_to_remove for i in range(len(edges))])
+        edges = edges[keep_mask]
+    
+    # Return early if no edges remain
+    if len(edges) == 0:
+        return edges, nodes, error_messages
     
     # Filter 4: Remove duplicate edges
-    if len(edges) > 0:
-        unique_edges = set(tuple(e) for e in edges)
-        if len(unique_edges) < len(edges):
-            error_messages.append(f"Removed {len(edges) - len(unique_edges)} duplicate edges")
-            edges = np.array(list(unique_edges))
+    unique_edges = set(tuple(e) for e in edges)
+    if len(unique_edges) < len(edges):
+        error_messages.append(f"Removed {len(edges) - len(unique_edges)} duplicate edges")
+        edges = np.array(list(unique_edges))
     
     return edges, nodes, error_messages
 
@@ -277,7 +311,9 @@ def track_volume(volume: da.Array, threshold: float = 0.5,
             - 'edges': Array of edge connections [source_id, target_id]
             - 'sanitization_messages': List of sanitization messages
     """
-    t_max, z_max, y_max, x_max = volume.shape
+    # Dynamic shape unpacking for Zarr arrays
+    num_t, num_z, num_y, num_x = volume.shape
+    print(f"[TRACKER] Volume shape: T={num_t}, Z={num_z}, Y={num_y}, X={num_x}")
     
     all_nodes = []
     all_edges = []
@@ -286,14 +322,31 @@ def track_volume(volume: da.Array, threshold: float = 0.5,
     # Store peaks for each frame with their node IDs
     frame_peaks_with_ids = []
     
-    print(f"[TRACKER] Processing {t_max} time frames...")
+    print(f"[TRACKER] Processing {num_t} time frames...")
     
-    for t in range(t_max):
-        # Load frame
+    for t in range(num_t):
+        # Load frame with memory hygiene
         frame = volume[t, :, :, :].compute()
+        
+        # Empty frame guard: skip if frame is empty or invalid
+        if frame.size == 0 or np.isnan(frame).all():
+            print(f"[TRACKER] Frame {t}: Empty or invalid frame, skipping")
+            frame_peaks_with_ids.append({'peaks': np.empty((0, 3)), 'node_ids': []})
+            del frame
+            gc.collect()
+            continue
         
         # Detect peaks using multi-scale DoG
         peaks = detect_peaks_multiscale_dog(frame, threshold, min_distance)
+        
+        # Empty frame guard: skip if no peaks detected
+        if len(peaks) == 0:
+            print(f"[TRACKER] Frame {t}: No peaks detected")
+            frame_peaks_with_ids.append({'peaks': np.empty((0, 3)), 'node_ids': []})
+            del frame
+            del peaks
+            gc.collect()
+            continue
         
         # Assign node IDs
         frame_node_ids = []
@@ -310,28 +363,43 @@ def track_volume(volume: da.Array, threshold: float = 0.5,
         
         print(f"[TRACKER] Frame {t}: Detected {len(peaks)} cells")
         
-        # Memory hygiene: clear frame
+        # Memory hygiene: clear frame and peaks
         del frame
+        del peaks
         gc.collect()
     
-    # Link consecutive frames
-    for t in range(t_max - 1):
+    # Link consecutive frames with empty frame guards
+    for t in range(num_t - 1):
         frame1_data = frame_peaks_with_ids[t]
         frame2_data = frame_peaks_with_ids[t + 1]
         
-        if len(frame1_data['peaks']) > 0 and len(frame2_data['peaks']) > 0:
-            links = link_frames_hungarian(frame1_data['peaks'], frame2_data['peaks'])
-            
-            for idx1, idx2 in links:
-                source_id = frame1_data['node_ids'][idx1]
-                target_id = frame2_data['node_ids'][idx2]
-                all_edges.append([source_id, target_id])
-            
-            print(f"[TRACKER] Frame {t}→{t+1}: Created {len(links)} links")
+        # Empty frame guard: skip if either frame has no peaks
+        if len(frame1_data['peaks']) == 0 or len(frame2_data['peaks']) == 0:
+            print(f"[TRACKER] Frame {t}→{t+1}: Skipping (empty frame)")
+            continue
+        
+        links = link_frames_hungarian(frame1_data['peaks'], frame2_data['peaks'])
+        
+        # Empty frame guard: skip if no links created
+        if len(links) == 0:
+            print(f"[TRACKER] Frame {t}→{t+1}: No links created")
+            continue
+        
+        for idx1, idx2 in links:
+            source_id = frame1_data['node_ids'][idx1]
+            target_id = frame2_data['node_ids'][idx2]
+            all_edges.append([source_id, target_id])
+        
+        print(f"[TRACKER] Frame {t}→{t+1}: Created {len(links)} links")
     
-    # Convert to numpy arrays
-    nodes_array = np.array(all_nodes)
-    edges_array = np.array(all_edges) if all_edges else np.empty((0, 2))
+    # Convert to numpy arrays with empty frame guards
+    if len(all_nodes) == 0:
+        print(f"[TRACKER] WARNING: No nodes detected in entire volume")
+        nodes_array = np.empty((0, 4))
+        edges_array = np.empty((0, 2))
+    else:
+        nodes_array = np.array(all_nodes)
+        edges_array = np.array(all_edges) if all_edges else np.empty((0, 2))
     
     # Apply graph hygiene sanitization
     print(f"[TRACKER] Applying graph hygiene sanitization...")

@@ -1,3 +1,9 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:system"
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "mcp.servers": {
+        "kaggle": {
+            "url": "https://www.kaggle.com/mcp",
+            "type": "http"
+        }
+    }
 }
