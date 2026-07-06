@@ -88,6 +88,13 @@ with hud4:
 if "playback_active" not in st.session_state: st.session_state.playback_active = False
 if "playback_frame" not in st.session_state: st.session_state.playback_frame = 0
 
+# Initialize CV variables globally
+cv_enabled = False
+n_folds = 5
+run_cv_btn = None
+multi_scale = True
+threshold = 0.5
+
 # Sidebar with expanders
 with st.sidebar:
     st.header("📁 Dataset Selection")
@@ -156,11 +163,6 @@ with st.sidebar:
     
     st.divider()
     
-    # Initialize CV variables
-    cv_enabled = False
-    n_folds = 5
-    run_cv_btn = None
-    
     with st.expander("📊 Cross-Validation"):
         cv_enabled = st.checkbox("Enable Cross-Validation")
         if cv_enabled:
@@ -228,7 +230,7 @@ if selected_dataset:
                             hovertemplate="Node ID: %{fullData.name}<br>X: %{x:.1f}<br>Y: %{y:.1f}<extra></extra>"
                         ))
             
-            st.plotly_chart(fig_xy, width="full")
+            st.plotly_chart(fig_xy, width="stretch")
         
         with col2:
             # XZ Plane
@@ -248,7 +250,7 @@ if selected_dataset:
                 paper_bgcolor="#161b22",
                 font=dict(color="#e6edf3")
             )
-            st.plotly_chart(fig_xz, width="full")
+            st.plotly_chart(fig_xz, width="stretch")
             
             # YZ Plane
             fig_yz = go.Figure(data=go.Heatmap(
@@ -267,7 +269,7 @@ if selected_dataset:
                 paper_bgcolor="#161b22",
                 font=dict(color="#e6edf3")
             )
-            st.plotly_chart(fig_yz, width="full")
+            st.plotly_chart(fig_yz, width="stretch")
     
     with tab2:
         st.subheader("Cell Division Lineage Tracking")
@@ -337,7 +339,7 @@ if selected_dataset:
                 showlegend=False
             )
             
-            st.plotly_chart(fig_lineage, width="full")
+            st.plotly_chart(fig_lineage, width="stretch")
             
             # Division detection
             divisions = [n for n in G.nodes() if G.out_degree(n) >= 2]
@@ -373,7 +375,7 @@ if selected_dataset:
                 paper_bgcolor="#161b22",
                 font=dict(color="#e6edf3")
             )
-            st.plotly_chart(fig_counts, width="full")
+            st.plotly_chart(fig_counts, width="stretch")
             
             # Statistics
             col1, col2, col3 = st.columns(3)
@@ -547,3 +549,12 @@ if export_btn and selected_dataset:
         sub_df.to_csv("submission.csv", index=False)
         st.success(f"Exported {len(sub_df)} rows to submission.csv")
         st.dataframe(sub_df.head(20))
+        
+        # Add download button
+        csv_data = sub_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Download Kaggle Submission CSV",
+            data=csv_data,
+            file_name="submission.csv",
+            mime="text/csv"
+        )
