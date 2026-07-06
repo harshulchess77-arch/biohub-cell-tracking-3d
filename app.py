@@ -156,6 +156,11 @@ with st.sidebar:
     
     st.divider()
     
+    # Initialize CV variables
+    cv_enabled = False
+    n_folds = 5
+    run_cv_btn = None
+    
     with st.expander("📊 Cross-Validation"):
         cv_enabled = st.checkbox("Enable Cross-Validation")
         if cv_enabled:
@@ -223,7 +228,7 @@ if selected_dataset:
                             hovertemplate="Node ID: %{fullData.name}<br>X: %{x:.1f}<br>Y: %{y:.1f}<extra></extra>"
                         ))
             
-            st.plotly_chart(fig_xy, use_container_width=True)
+            st.plotly_chart(fig_xy, width="full")
         
         with col2:
             # XZ Plane
@@ -243,7 +248,7 @@ if selected_dataset:
                 paper_bgcolor="#161b22",
                 font=dict(color="#e6edf3")
             )
-            st.plotly_chart(fig_xz, use_container_width=True)
+            st.plotly_chart(fig_xz, width="full")
             
             # YZ Plane
             fig_yz = go.Figure(data=go.Heatmap(
@@ -262,7 +267,7 @@ if selected_dataset:
                 paper_bgcolor="#161b22",
                 font=dict(color="#e6edf3")
             )
-            st.plotly_chart(fig_yz, use_container_width=True)
+            st.plotly_chart(fig_yz, width="full")
     
     with tab2:
         st.subheader("Cell Division Lineage Tracking")
@@ -332,7 +337,7 @@ if selected_dataset:
                 showlegend=False
             )
             
-            st.plotly_chart(fig_lineage, use_container_width=True)
+            st.plotly_chart(fig_lineage, width="full")
             
             # Division detection
             divisions = [n for n in G.nodes() if G.out_degree(n) >= 2]
@@ -368,7 +373,7 @@ if selected_dataset:
                 paper_bgcolor="#161b22",
                 font=dict(color="#e6edf3")
             )
-            st.plotly_chart(fig_counts, use_container_width=True)
+            st.plotly_chart(fig_counts, width="full")
             
             # Statistics
             col1, col2, col3 = st.columns(3)
