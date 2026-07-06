@@ -19,10 +19,11 @@ Key Features:
 """
 
 import numpy as np
-import dask.array as da
-import zarr
 import gc
 import os
+import json
+import zlib
+import gzip
 from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
@@ -126,6 +127,97 @@ class VelocityTrack:
     def get_velocity(self) -> np.ndarray:
         """Get current velocity vector."""
         return self.velocity
+
+
+# ============================================================================
+# Pure Native Zarr Reader (No zarr package dependency)
+# ============================================================================
+
+def read_zarr_native(zarr_path: str) -> np.ndarray:
+    """
+    Read Zarr dataset using pure native Python libraries.
+    Reads .zarray metadata and binary chunks directly without zarr package.
+    
+    Args:
+        zarr_path: Path to zarr dataset directory
+        
+    Returns:
+        NumPy array containing the full 4D volume [T, Z, Y, X]
+    """
+    # Read .zarray metadata
+    zarray_path = os.path.join(zarr_path, '.zarray')
+    with open(zarray_path, 'r') as f:
+        metadata = json.load(f)
+    
+    shape = tuple(metadata['shape'])  # [T, Z, Y, X]
+    chunks = tuple(metadata['chunks'])  # Chunk shape
+    dtype = np.dtype(metadata['dtype'])
+    compressor = metadata.get('compressor', None)
+    
+    print(f"[ZARR_NATIVE] Shape: {shape}, Chunks: {chunks}, Dtype: {dtype}")
+    print(f"[ZARR_NATIVE] Compressor: {compressor}")
+    
+    # Initialize output array
+    volume = np.zeros(shape, dtype=dtype)
+    
+    # Calculate chunk grid dimensions
+    chunk_grid = [ (shape[i] + chunks[i] - 1) // chunks[i] for i in range(len(shape)) ]
+    
+    # Read each chunk
+    for chunk_idx in np.ndindex(*chunk_grid):
+        # Build chunk filename (e.g., '0.0.0.0')
+        chunk_filename = '.'.join(map(str, chunk_idx))
+        chunk_path = os.path.join(zarr_path, chunk_filename)
+        
+        if not os.path.exists(chunk_path):
+            print(f"[ZARR_NATIVE] Warning: Chunk {chunk_filename} not found, skipping")
+            continue
+        
+        # Read binary chunk data
+        with open(chunk_path, 'rb') as f:
+            chunk_data = f.read()
+        
+        # Decompress if needed
+        if compressor is not None:
+            compressor_id = compressor.get('id', '')
+            try:
+                if compressor_id == 'zlib':
+                    chunk_data = zlib.decompress(chunk_data)
+                elif compressor_id == 'gzip':
+                    chunk_data = gzip.decompress(chunk_data)
+                elif 'blosc' in compressor_id:
+                    # Blosc2 not supported natively, try raw read
+                    print(f"[ZARR_NATIVE] Warning: Blosc compression not natively supported, reading raw")
+                else:
+                    print(f"[ZARR_NATIVE] Warning: Unknown compressor {compressor_id}, reading raw")
+            except Exception as e:
+                print(f"[ZARR_NATIVE] Decompression failed for {chunk_filename}: {e}, reading raw")
+        
+        # Convert to numpy array
+        chunk_array = np.frombuffer(chunk_data, dtype=dtype)
+        chunk_array = chunk_array.reshape(chunks)
+        
+        # Calculate slice indices for this chunk
+        slice_obj = tuple(
+            slice(idx * chunk_size, min((idx + 1) * chunk_size, shape[i]))
+            for i, (idx, chunk_size) in enumerate(zip(chunk_idx, chunks))
+        )
+        
+        # Handle edge case where chunk is smaller than chunk size
+        chunk_slice = tuple(
+            slice(0, min(chunk_size, shape[i] - idx * chunk_size))
+            for i, (idx, chunk_size) in enumerate(zip(chunk_idx, chunks))
+        )
+        
+        # Insert chunk into volume
+        volume[slice_obj] = chunk_array[chunk_slice]
+        
+        # Memory hygiene
+        del chunk_data, chunk_array
+        gc.collect()
+    
+    print(f"[ZARR_NATIVE] Successfully loaded volume of shape {volume.shape}")
+    return volume
 
 
 # ============================================================================
@@ -698,14 +790,14 @@ def sanitize_graph_networkx(edges: np.ndarray, nodes: np.ndarray) -> Tuple[np.nd
     return sanitized_edges, nodes, error_messages
 
 
-def track_volume_velocity(volume: da.Array, 
+def track_volume_velocity(volume: np.ndarray, 
                          threshold: float = 0.5,
                          min_distance: int = 5) -> Dict[str, np.ndarray]:
     """
     Track cells across all time frames using velocity-based motion prediction.
     
     Args:
-        volume: 4D volume array [T, Z, Y, X] (dask array for lazy loading)
+        volume: 4D volume array [T, Z, Y, X] (numpy array)
         threshold: Detection threshold for peak finding
         min_distance: Minimum pixel distance between peaks
         
@@ -715,7 +807,7 @@ def track_volume_velocity(volume: da.Array,
             - 'edges': Array of edge connections [source_id, target_id]
             - 'sanitization_messages': List of sanitization messages
     """
-    # Dynamic shape unpacking for Zarr arrays
+    # Dynamic shape unpacking
     num_t, num_z, num_y, num_x = volume.shape
     print(f"[TRACKER] Volume shape: T={num_t}, Z={num_z}, Y={num_y}, X={num_x}")
     
@@ -733,8 +825,8 @@ def track_volume_velocity(volume: da.Array,
     print(f"[TRACKER] Processing {num_t} time frames with velocity-based tracking...")
     
     for t in range(num_t):
-        # Load frame with memory hygiene
-        frame = volume[t, :, :, :].compute()
+        # Load frame directly from numpy array
+        frame = volume[t, :, :, :].copy()  # Copy to avoid modifying original
         
         # Empty frame guard: skip if frame is empty or invalid
         if frame.size == 0 or np.isnan(frame).all():
@@ -850,6 +942,7 @@ def process_zarr_dataset_velocity(zarr_path: str,
                                   min_distance: int = 5) -> Dict[str, np.ndarray]:
     """
     Track cells in a zarr dataset with velocity-based motion prediction.
+    Uses pure native Zarr reader (no zarr package dependency).
     
     Args:
         zarr_path: Path to zarr dataset
@@ -859,15 +952,13 @@ def process_zarr_dataset_velocity(zarr_path: str,
     Returns:
         Dictionary with nodes and edges
     """
-    # Open zarr dataset with memory-mapped lazy loading
-    zarr_store = zarr.open(zarr_path, mode='r')
-    volume = da.from_zarr(zarr_store)
+    # Read zarr dataset using pure native reader
+    volume = read_zarr_native(zarr_path)
     
     results = track_volume_velocity(volume, threshold, min_distance)
     
-    # Memory hygiene: close zarr store
+    # Memory hygiene: clear volume
     del volume
-    del zarr_store
     gc.collect()
     
     return results
