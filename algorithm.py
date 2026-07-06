@@ -1,6 +1,6 @@
 """
-BioHub Cell Tracking - First-Place Competition Algorithm
-Adaptive Multi-Scale Blob Extraction with Kalman Filter Cognitive Tracking
+BioHub Cell Tracking - Elite Competition Algorithm
+Adaptive Multi-Scale Blob Extraction with Velocity-Based Cognitive Tracking
 
 This script implements a state-of-the-art cell tracking pipeline optimized for the
 BioHub Cell Tracking During Development Kaggle competition.
@@ -8,9 +8,12 @@ BioHub Cell Tracking During Development Kaggle competition.
 Key Features:
 - Memory-mapped lazy loading with Zarr v3/blosc2
 - Physical anisotropy calibration (Z=1.625µm, Y=0.40625µm, X=0.40625µm)
-- Adaptive multi-scale blob extraction (1.2µm to 4.0µm physical space)
-- Kalman Filter cognitive tracking with motion prediction
-- Mahalanobis distance cost matrix with 7.5µm gating
+- Adaptive multi-scale blob extraction (1.2µm to 3.8µm physical space)
+- Local intensity centroid refinement for sub-voxel accuracy
+- Velocity-based motion prediction with constant-velocity model
+- Euclidean distance cost matrix with 7.0µm gating
+- Gap closing mechanism (1-to-2 frame look-ahead)
+- Mitosis detection (1-to-2 branching)
 - NetworkX graph hygiene sanitization
 - Kaggle-compliant export format
 """
@@ -20,11 +23,10 @@ import dask.array as da
 import zarr
 import gc
 import os
-from scipy.ndimage import gaussian_filter, maximum_filter, laplace
+from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial.distance import mahalanobis, cdist
-from scipy.linalg import cholesky, inv
-from typing import List, Tuple, Dict, Optional
+from scipy.spatial.distance import cdist
+from typing import List, Tuple, Dict
 from collections import defaultdict
 import networkx as nx
 
@@ -40,138 +42,85 @@ VOXEL_SIZE_Y = 0.40625  # Y-axis: 0.40625 µm/voxel
 VOXEL_SIZE_X = 0.40625  # X-axis: 0.40625 µm/voxel
 
 # Maximum physical distance for cell tracking between frames (µm)
-MAX_DISTANCE_THRESHOLD = 7.5  # 7.5 µm strict gating (updated for cognitive tracking)
+MAX_DISTANCE_THRESHOLD = 7.0  # 7.0 µm strict gating
 
 # Adaptive multi-scale blob extraction parameters
 MIN_PHYSICAL_SIGMA = 1.2  # Minimum sigma in physical space (µm)
-MAX_PHYSICAL_SIGMA = 4.0  # Maximum sigma in physical space (µm)
+MAX_PHYSICAL_SIGMA = 3.8  # Maximum sigma in physical space (µm)
 NUM_SIGMA_SCALES = 8  # Number of sigma scales for adaptive detection
 
+# Gap closing parameters
+GAP_CLOSING_RADIUS = 5.5  # µm proximity for gap recovery
+MAX_GAP_FRAMES = 2  # Look-ahead frames for gap closing
+
+# Mitosis detection parameters
+MITOSIS_EXPANSION_RADIUS = 8.0  # µm radius for mitosis detection
+
 # ============================================================================
-# Kalman Filter Implementation for Cognitive Tracking
+# Velocity-Based Motion Model for Cognitive Tracking
 # ============================================================================
 
-class KalmanFilter:
+class VelocityTrack:
     """
-    Constant-velocity Kalman Filter for motion prediction in cell tracking.
-    
-    State vector: [x, y, z, vx, vy, vz] (position and velocity)
-    """
-    
-    def __init__(self, initial_state: np.ndarray, dt: float = 1.0, 
-                 process_noise: float = 0.1, measurement_noise: float = 0.5):
-        """
-        Initialize Kalman Filter.
-        
-        Args:
-            initial_state: Initial state vector [x, y, z, vx, vy, vz]
-            dt: Time step between frames
-            process_noise: Process noise covariance
-            measurement_noise: Measurement noise covariance
-        """
-        self.dt = dt
-        self.state_dim = 6  # [x, y, z, vx, vy, vz]
-        self.meas_dim = 3   # [x, y, z]
-        
-        # State vector
-        self.x = initial_state.copy()
-        
-        # State transition matrix (constant velocity model)
-        self.F = np.eye(self.state_dim)
-        self.F[0, 3] = self.dt  # x = x + vx * dt
-        self.F[1, 4] = self.dt  # y = y + vy * dt
-        self.F[2, 5] = self.dt  # z = z + vz * dt
-        
-        # Measurement matrix (we only observe position)
-        self.H = np.zeros((self.meas_dim, self.state_dim))
-        self.H[0, 0] = 1  # observe x
-        self.H[1, 1] = 1  # observe y
-        self.H[2, 2] = 1  # observe z
-        
-        # Process noise covariance
-        self.Q = np.eye(self.state_dim) * process_noise
-        
-        # Measurement noise covariance
-        self.R = np.eye(self.meas_dim) * measurement_noise
-        
-        # State covariance matrix
-        self.P = np.eye(self.state_dim) * 1.0
-    
-    def predict(self) -> np.ndarray:
-        """
-        Predict next state using motion model.
-        
-        Returns:
-            Predicted state vector
-        """
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
-        return self.x[:3]  # Return predicted position
-    
-    def update(self, measurement: np.ndarray):
-        """
-        Update state with new measurement.
-        
-        Args:
-            measurement: Measured position [x, y, z]
-        """
-        z = measurement.reshape(-1, 1)
-        y = z - self.H @ self.x.reshape(-1, 1)
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ inv(S)
-        self.x = self.x + (K @ y).flatten()
-        self.P = (np.eye(self.state_dim) - K @ self.H) @ self.P
-    
-    def get_position(self) -> np.ndarray:
-        """Get current position estimate."""
-        return self.x[:3]
-    
-    def get_velocity(self) -> np.ndarray:
-        """Get current velocity estimate."""
-        return self.x[3:]
-
-
-class Track:
-    """
-    Represents a single cell track with Kalman Filter state.
+    Represents a single cell track with velocity-based motion prediction.
+    Uses constant-velocity model: r_hat = r_t + lambda_v * (r_t - r_{t-1})
     """
     
     def __init__(self, track_id: int, initial_position: np.ndarray, 
-                 initial_time: int, dt: float = 1.0):
+                 initial_time: int, lambda_v: float = 1.0):
         """
         Initialize track.
         
         Args:
             track_id: Unique track identifier
-            initial_position: Initial position [x, y, z]
+            initial_position: Initial position [z, y, x]
             initial_time: Initial time frame
-            dt: Time step between frames
+            lambda_v: Velocity scaling factor for motion prediction
         """
         self.track_id = track_id
         self.positions = [initial_position]
         self.times = [initial_time]
-        
-        # Initialize Kalman Filter with zero initial velocity
-        initial_state = np.array([initial_position[0], initial_position[1], 
-                                   initial_position[2], 0, 0, 0])
-        self.kf = KalmanFilter(initial_state, dt=dt)
+        self.lambda_v = lambda_v
         self.active = True
         self.age = 0
+        self.velocity = np.zeros(3)  # Initial velocity is zero
     
-    def predict(self) -> np.ndarray:
-        """Predict next position using Kalman Filter."""
-        return self.kf.predict()
+    def predict_next_position(self) -> np.ndarray:
+        """
+        Predict next position using velocity-based motion model.
+        r_hat = r_t + lambda_v * (r_t - r_{t-1})
+        
+        Returns:
+            Predicted position [z, y, x]
+        """
+        if len(self.positions) < 2:
+            # Not enough history, return current position
+            return self.positions[-1]
+        
+        current_pos = self.positions[-1]
+        prev_pos = self.positions[-2]
+        
+        # Calculate velocity vector
+        velocity = current_pos - prev_pos
+        self.velocity = velocity
+        
+        # Predict next position
+        predicted = current_pos + self.lambda_v * velocity
+        return predicted
     
     def update(self, position: np.ndarray, time: int):
         """Update track with new measurement."""
-        self.kf.update(position)
         self.positions.append(position)
         self.times.append(time)
         self.age += 1
     
-    def get_state(self) -> np.ndarray:
-        """Get current Kalman Filter state."""
-        return self.kf.get_position()
+    def get_position(self) -> np.ndarray:
+        """Get current position."""
+        return self.positions[-1]
+    
+    def get_velocity(self) -> np.ndarray:
+        """Get current velocity vector."""
+        return self.velocity
 
 
 # ============================================================================
@@ -236,12 +185,62 @@ def physical_sigma_to_voxel(sigma_physical: float) -> float:
     return sigma_physical / VOXEL_SIZE_X  # Use X as reference
 
 
+def refine_centroid_local_intensity(volume: np.ndarray, 
+                                  peak_coords: np.ndarray,
+                                  window_size: int = 3) -> np.ndarray:
+    """
+    Refine peak coordinates using local intensity centroid for sub-voxel accuracy.
+    
+    Args:
+        volume: 3D volume array [Z, Y, X]
+        peak_coords: Peak coordinates [N, 3] in voxel space
+        window_size: Size of local window for centroid calculation
+        
+    Returns:
+        Refined peak coordinates [N, 3] with sub-voxel precision
+    """
+    refined_coords = []
+    
+    for peak in peak_coords:
+        z, y, x = peak
+        z, y, x = int(z), int(y), int(x)
+        
+        # Extract local window
+        z_start = max(0, z - window_size // 2)
+        z_end = min(volume.shape[0], z + window_size // 2 + 1)
+        y_start = max(0, y - window_size // 2)
+        y_end = min(volume.shape[1], y + window_size // 2 + 1)
+        x_start = max(0, x - window_size // 2)
+        x_end = min(volume.shape[2], x + window_size // 2 + 1)
+        
+        local_window = volume[z_start:z_end, y_start:y_end, x_start:x_end]
+        
+        # Compute intensity-weighted centroid
+        if local_window.sum() > 0:
+            zz, yy, xx = np.meshgrid(
+                np.arange(z_start, z_end),
+                np.arange(y_start, y_end),
+                np.arange(x_start, x_end),
+                indexing='ij'
+            )
+            
+            weighted_z = (zz * local_window).sum() / local_window.sum()
+            weighted_y = (yy * local_window).sum() / local_window.sum()
+            weighted_x = (xx * local_window).sum() / local_window.sum()
+            
+            refined_coords.append([weighted_z, weighted_y, weighted_x])
+        else:
+            refined_coords.append([z, y, x])
+    
+    return np.array(refined_coords)
+
+
 def detect_peaks_adaptive_multiscale(volume: np.ndarray, 
                                      threshold: float = 0.5,
                                      min_distance: int = 5) -> np.ndarray:
     """
-    Detect peaks using Adaptive Multi-Scale Blob Extraction.
-    Uses physical space sigma ranges (1.2µm to 4.0µm) to handle dramatic
+    Detect peaks using Adaptive Multi-Scale Blob Extraction with local refinement.
+    Uses physical space sigma ranges (1.2µm to 3.8µm) to handle dramatic
     size differences between massive early blastomeres and tiny dense clusters.
     
     Args:
@@ -250,7 +249,7 @@ def detect_peaks_adaptive_multiscale(volume: np.ndarray,
         min_distance: Minimum pixel distance between peaks
         
     Returns:
-        Array of detected peak coordinates [z, y, x]
+        Array of refined peak coordinates [z, y, x] with sub-voxel precision
     """
     # Generate adaptive sigma scales in physical space
     physical_sigmas = np.linspace(MIN_PHYSICAL_SIGMA, MAX_PHYSICAL_SIGMA, NUM_SIGMA_SCALES)
@@ -293,48 +292,37 @@ def detect_peaks_adaptive_multiscale(volume: np.ndarray,
     # Get peak coordinates
     peak_coords = np.argwhere(peak_mask)
     
+    # Apply local intensity centroid refinement for sub-voxel accuracy
+    if len(peak_coords) > 0:
+        peak_coords = refine_centroid_local_intensity(volume, peak_coords, window_size=3)
+    
     return peak_coords
 
 
-def compute_mahalanobis_distance(predicted: np.ndarray, 
-                                 detected: np.ndarray,
-                                 covariance: np.ndarray) -> np.ndarray:
+def compute_euclidean_distance(predicted: np.ndarray, 
+                               detected: np.ndarray) -> np.ndarray:
     """
-    Compute Mahalanobis distance between predicted and detected positions.
+    Compute Euclidean distance between predicted and detected positions.
     
     Args:
-        predicted: Predicted positions [N, 3]
-        detected: Detected positions [M, 3]
-        covariance: Covariance matrix for Mahalanobis distance
+        predicted: Predicted positions [N, 3] in physical space
+        detected: Detected positions [M, 3] in physical space
         
     Returns:
         Distance matrix [N, M]
     """
-    # Compute inverse covariance
-    inv_cov = inv(covariance)
-    
-    # Compute pairwise Mahalanobis distances
-    n_pred = predicted.shape[0]
-    n_det = detected.shape[0]
-    distance_matrix = np.zeros((n_pred, n_det))
-    
-    for i in range(n_pred):
-        for j in range(n_det):
-            diff = predicted[i] - detected[j]
-            distance_matrix[i, j] = np.sqrt(diff @ inv_cov @ diff.T)
-    
-    return distance_matrix
+    return cdist(predicted, detected, metric='euclidean')
 
 
-def link_frames_kalman(tracks: List[Track], 
-                       detected_peaks: np.ndarray,
-                       frame_time: int) -> Tuple[List[Tuple[int, int]], List[Track]]:
+def link_frames_velocity(tracks: List[VelocityTrack], 
+                          detected_peaks: np.ndarray,
+                          frame_time: int) -> Tuple[List[Tuple[int, int]], List[VelocityTrack]]:
     """
-    Link detected peaks to existing tracks using Kalman Filter predictions.
-    Uses Mahalanobis distance with 7.5µm gating.
+    Link detected peaks to existing tracks using velocity-based motion prediction.
+    Uses Euclidean distance with 7.0µm gating.
     
     Args:
-        tracks: List of active Track objects
+        tracks: List of active VelocityTrack objects
         detected_peaks: Detected peak coordinates [N, 3] in voxel space
         frame_time: Current time frame
         
@@ -352,8 +340,9 @@ def link_frames_kalman(tracks: List[Track],
     track_indices = []
     for i, track in enumerate(tracks):
         if track.active:
-            pred = track.predict()
-            predictions.append(pred)
+            pred = track.predict_next_position()
+            pred_physical = voxel_to_physical(pred)
+            predictions.append(pred_physical)
             track_indices.append(i)
     
     if len(predictions) == 0:
@@ -361,12 +350,8 @@ def link_frames_kalman(tracks: List[Track],
     
     predictions = np.array(predictions)
     
-    # Compute covariance matrix for Mahalanobis distance
-    # Use physical dimensions for anisotropic covariance
-    covariance = np.diag([VOXEL_SIZE_Z**2, VOXEL_SIZE_Y**2, VOXEL_SIZE_X**2]) * 2.0
-    
-    # Compute Mahalanobis distance matrix
-    distance_matrix = compute_mahalanobis_distance(predictions, detected_physical, covariance)
+    # Compute Euclidean distance matrix
+    distance_matrix = compute_euclidean_distance(predictions, detected_physical)
     
     # Apply distance threshold (set large distances to infinity)
     distance_matrix[distance_matrix > MAX_DISTANCE_THRESHOLD] = np.inf
@@ -390,16 +375,177 @@ def link_frames_kalman(tracks: List[Track],
         if j not in assigned_detection_indices:
             # Create new track
             new_track_id = len(tracks) + len(new_tracks)
-            new_track = Track(new_track_id, peak, frame_time)
+            new_track = VelocityTrack(new_track_id, peak, frame_time)
             new_tracks.append(new_track)
     
     return valid_assignments, new_tracks
 
 
+def close_gaps(tracks: List[VelocityTrack], 
+              frame_to_node_ids: List[List[int]],
+              nodes: List[List[int]],
+              num_frames: int) -> List[Tuple[int, int]]:
+    """
+    Implement 1-to-2 frame look-ahead gap recovery mechanism.
+    If a track ends abruptly at frame T, look ahead to frames T+2 and T+3.
+    If a new track emerges within GAP_CLOSING_RADIUS (5.5µm), bridge the gap.
+    
+    Args:
+        tracks: List of VelocityTrack objects
+        frame_to_node_ids: Mapping from frame to node IDs
+        nodes: List of node coordinates [t, z, y, x]
+        num_frames: Total number of frames
+        
+    Returns:
+        List of gap-closing edges (source_id, target_id)
+    """
+    gap_edges = []
+    
+    for track in tracks:
+        if len(track.positions) < 2:
+            continue
+        
+        last_time = track.times[-1]
+        last_pos = track.positions[-1]
+        
+        # Look ahead up to MAX_GAP_FRAMES
+        for gap in range(1, MAX_GAP_FRAMES + 1):
+            look_ahead_frame = last_time + gap
+            
+            if look_ahead_frame >= num_frames:
+                break
+            
+            if look_ahead_frame >= len(frame_to_node_ids):
+                break
+            
+            # Find tracks that start at look_ahead_frame
+            for other_track in tracks:
+                if other_track.track_id == track.track_id:
+                    continue
+                
+                if len(other_track.times) == 0:
+                    continue
+                
+                if other_track.times[0] == look_ahead_frame:
+                    other_pos = other_track.positions[0]
+                    
+                    # Calculate physical distance
+                    last_pos_phys = voxel_to_physical(np.array(last_pos))
+                    other_pos_phys = voxel_to_physical(np.array(other_pos))
+                    distance = np.linalg.norm(last_pos_phys - other_pos_phys)
+                    
+                    if distance <= GAP_CLOSING_RADIUS:
+                        # Bridge the gap
+                        # Find corresponding node IDs
+                        if last_time < len(frame_to_node_ids) and look_ahead_frame < len(frame_to_node_ids):
+                            # Find node IDs for these positions
+                            source_idx = -1
+                            target_idx = -1
+                            
+                            # Find source node ID
+                            for i, (t, z, y, x) in enumerate(nodes):
+                                if t == last_time:
+                                    if np.allclose([z, y, x], last_pos, atol=1.0):
+                                        source_idx = i
+                                        break
+                            
+                            # Find target node ID
+                            for i, (t, z, y, x) in enumerate(nodes):
+                                if t == look_ahead_frame:
+                                    if np.allclose([z, y, x], other_pos, atol=1.0):
+                                        target_idx = i
+                                        break
+                            
+                            if source_idx >= 0 and target_idx >= 0:
+                                gap_edges.append((source_idx, target_idx))
+                                print(f"[GAP_CLOSING] Bridged gap from frame {last_time} to {look_ahead_frame} (distance: {distance:.2f}µm)")
+                            break
+    
+    return gap_edges
+
+
+def detect_mitosis(tracks: List[VelocityTrack],
+                  frame_to_node_ids: List[List[int]],
+                  nodes: List[List[int]]) -> List[Tuple[int, int, int]]:
+    """
+    Detect mitosis events (1-to-2 branching).
+    If a single source node terminates and pairs cleanly with two new target nodes
+    in the next immediate frame within MITOSIS_EXPANSION_RADIUS, register as split.
+    
+    Args:
+        tracks: List of VelocityTrack objects
+        frame_to_node_ids: Mapping from frame to node IDs
+        nodes: List of node coordinates [t, z, y, x]
+        
+    Returns:
+        List of mitosis edges (source_id, target_id1, target_id2)
+    """
+    mitosis_events = []
+    
+    for track in tracks:
+        if len(track.positions) < 2:
+            continue
+        
+        last_time = track.times[-1]
+        last_pos = track.positions[-1]
+        
+        # Look for tracks that start at last_time + 1
+        next_frame = last_time + 1
+        potential_daughters = []
+        
+        for other_track in tracks:
+            if other_track.track_id == track.track_id:
+                continue
+            
+            if len(other_track.times) == 0:
+                continue
+            
+            if other_track.times[0] == next_frame:
+                other_pos = other_track.positions[0]
+                
+                # Calculate physical distance
+                last_pos_phys = voxel_to_physical(np.array(last_pos))
+                other_pos_phys = voxel_to_physical(np.array(other_pos))
+                distance = np.linalg.norm(last_pos_phys - other_pos_phys)
+                
+                if distance <= MITOSIS_EXPANSION_RADIUS:
+                    potential_daughters.append((other_track, distance, other_pos))
+        
+        # If exactly 2 potential daughters, register as mitosis
+        if len(potential_daughters) == 2:
+            daughter1, dist1, pos1 = potential_daughters[0]
+            daughter2, dist2, pos2 = potential_daughters[1]
+            
+            # Find corresponding node IDs
+            source_idx = -1
+            target_idx1 = -1
+            target_idx2 = -1
+            
+            for i, (t, z, y, x) in enumerate(nodes):
+                if t == last_time:
+                    if np.allclose([z, y, x], last_pos, atol=1.0):
+                        source_idx = i
+                        break
+            
+            for i, (t, z, y, x) in enumerate(nodes):
+                if t == next_frame:
+                    if np.allclose([z, y, x], pos1, atol=1.0):
+                        target_idx1 = i
+                    elif np.allclose([z, y, x], pos2, atol=1.0):
+                        target_idx2 = i
+            
+            if source_idx >= 0 and target_idx1 >= 0 and target_idx2 >= 0:
+                mitosis_events.append((source_idx, target_idx1, target_idx2))
+                print(f"[MITOSIS] Detected division at frame {last_time} → {next_frame} (distances: {dist1:.2f}µm, {dist2:.2f}µm)")
+    
+    return mitosis_events
+
+
 def sanitize_graph_networkx(edges: np.ndarray, nodes: np.ndarray) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Implement comprehensive graph hygiene sanitization using NetworkX.
-    Removes structural anomalies: multi-parent errors, self-loops, multi-frame jumps.
+    Removes structural anomalies: multi-parent errors, self-loops, multi-frame jumps,
+    and isolated single-frame orphan nodes.
     
     Args:
         edges: Array of edge connections [source_id, target_id]
@@ -513,17 +659,45 @@ def sanitize_graph_networkx(edges: np.ndarray, nodes: np.ndarray) -> Tuple[np.nd
             G.nodes[idx]['position'] = (z, y, x)
         G.add_edges_from(unique_edges)
     
+    # Filter 5: Remove isolated single-frame orphan nodes
+    node_degrees = dict(G.degree())
+    isolated_nodes = [node for node, degree in node_degrees.items() if degree == 0]
+    if isolated_nodes:
+        error_messages.append(f"Removed {len(isolated_nodes)} isolated single-frame orphan nodes")
+        # Remove isolated nodes from graph
+        G.remove_nodes_from(isolated_nodes)
+        # Remove corresponding nodes from nodes array
+        keep_mask = np.array([i not in isolated_nodes for i in range(len(nodes))])
+        nodes = nodes[keep_mask]
+        # Rebuild graph with filtered nodes
+        G = nx.DiGraph()
+        for idx, node in enumerate(nodes):
+            t, z, y, x = node
+            G.add_node(idx, time=t, position=(z, y, x))
+        for edge in unique_edges:
+            source_id, target_id = edge
+            if source_id not in isolated_nodes and target_id not in isolated_nodes:
+                # Remap node IDs after filtering
+                old_to_new = {}
+                new_idx = 0
+                for i in range(len(nodes) + len(isolated_nodes)):
+                    if i not in isolated_nodes:
+                        old_to_new[i] = new_idx
+                        new_idx += 1
+                if source_id in old_to_new and target_id in old_to_new:
+                    G.add_edge(old_to_new[source_id], old_to_new[target_id])
+    
     # Convert back to arrays
     sanitized_edges = np.array(list(G.edges()))
     
     return sanitized_edges, nodes, error_messages
 
 
-def track_volume_kalman(volume: da.Array, 
-                        threshold: float = 0.5,
-                        min_distance: int = 5) -> Dict[str, np.ndarray]:
+def track_volume_velocity(volume: da.Array, 
+                         threshold: float = 0.5,
+                         min_distance: int = 5) -> Dict[str, np.ndarray]:
     """
-    Track cells across all time frames using Kalman Filter cognitive tracking.
+    Track cells across all time frames using velocity-based motion prediction.
     
     Args:
         volume: 4D volume array [T, Z, Y, X] (dask array for lazy loading)
@@ -551,7 +725,7 @@ def track_volume_kalman(volume: da.Array,
     # Store frame-to-track mappings
     frame_to_node_ids = []
     
-    print(f"[TRACKER] Processing {num_t} time frames with Kalman Filter tracking...")
+    print(f"[TRACKER] Processing {num_t} time frames with velocity-based tracking...")
     
     for t in range(num_t):
         # Load frame with memory hygiene
@@ -565,7 +739,7 @@ def track_volume_kalman(volume: da.Array,
             gc.collect()
             continue
         
-        # Detect peaks using adaptive multi-scale blob extraction
+        # Detect peaks using adaptive multi-scale blob extraction with centroid refinement
         peaks = detect_peaks_adaptive_multiscale(frame, threshold, min_distance)
         
         # Empty frame guard: skip if no peaks detected
@@ -577,8 +751,8 @@ def track_volume_kalman(volume: da.Array,
             gc.collect()
             continue
         
-        # Link peaks to existing tracks using Kalman Filter
-        assignments, new_tracks = link_frames_kalman(active_tracks, peaks, t)
+        # Link peaks to existing tracks using velocity-based motion prediction
+        assignments, new_tracks = link_frames_velocity(active_tracks, peaks, t)
         
         # Update existing tracks with assignments
         current_frame_node_ids = []
@@ -628,6 +802,19 @@ def track_volume_kalman(volume: da.Array,
                         target_id = frame_to_node_ids[t2][i + 1]
                         all_edges.append([source_id, target_id])
     
+    # Apply gap closing mechanism
+    print(f"[TRACKER] Applying gap closing mechanism...")
+    gap_edges = close_gaps(active_tracks, frame_to_node_ids, all_nodes, num_t)
+    for source_id, target_id in gap_edges:
+        all_edges.append([source_id, target_id])
+    
+    # Apply mitosis detection
+    print(f"[TRACKER] Applying mitosis detection...")
+    mitosis_events = detect_mitosis(active_tracks, frame_to_node_ids, all_nodes)
+    for source_id, target_id1, target_id2 in mitosis_events:
+        all_edges.append([source_id, target_id1])
+        all_edges.append([source_id, target_id2])
+    
     # Convert to numpy arrays with empty frame guards
     if len(all_nodes) == 0:
         print(f"[TRACKER] WARNING: No nodes detected in entire volume")
@@ -653,11 +840,11 @@ def track_volume_kalman(volume: da.Array,
     }
 
 
-def process_zarr_dataset_kalman(zarr_path: str, 
-                                 threshold: float = 0.5,
-                                 min_distance: int = 5) -> Dict[str, np.ndarray]:
+def process_zarr_dataset_velocity(zarr_path: str, 
+                                  threshold: float = 0.5,
+                                  min_distance: int = 5) -> Dict[str, np.ndarray]:
     """
-    Track cells in a zarr dataset with Kalman Filter cognitive tracking.
+    Track cells in a zarr dataset with velocity-based motion prediction.
     
     Args:
         zarr_path: Path to zarr dataset
@@ -671,7 +858,7 @@ def process_zarr_dataset_kalman(zarr_path: str,
     zarr_store = zarr.open(zarr_path, mode='r')
     volume = da.from_zarr(zarr_store)
     
-    results = track_volume_kalman(volume, threshold, min_distance)
+    results = track_volume_velocity(volume, threshold, min_distance)
     
     # Memory hygiene: close zarr store
     del volume
@@ -755,16 +942,19 @@ def main():
     """
     Main execution pipeline for Kaggle submission.
     Processes all test datasets sequentially with memory hygiene.
+    Uses velocity-based motion prediction with gap closing and mitosis detection.
     """
     print("=" * 70)
-    print("BioHub Cell Tracking - First-Place Competition Algorithm")
-    print("Adaptive Multi-Scale Blob Extraction with Kalman Filter Cognitive Tracking")
+    print("BioHub Cell Tracking - Elite Competition Algorithm")
+    print("Adaptive Multi-Scale Blob Extraction with Velocity-Based Cognitive Tracking")
     print("=" * 70)
     print(f"Input Directory: {INPUT_DIR}")
     print(f"Output Path: {OUTPUT_PATH}")
     print(f"Physical Dimensions: Z={VOXEL_SIZE_Z}µm, Y={VOXEL_SIZE_Y}µm, X={VOXEL_SIZE_X}µm")
     print(f"Distance Threshold: {MAX_DISTANCE_THRESHOLD}µm")
     print(f"Multi-Scale Range: {MIN_PHYSICAL_SIGMA}µm to {MAX_PHYSICAL_SIGMA}µm")
+    print(f"Gap Closing Radius: {GAP_CLOSING_RADIUS}µm")
+    print(f"Mitosis Expansion Radius: {MITOSIS_EXPANSION_RADIUS}µm")
     print("=" * 70)
     
     # Check input directory
@@ -791,8 +981,8 @@ def main():
         print(f"[PROCESSING] Path: {zarr_path}")
         
         try:
-            # Run tracking with Kalman Filter cognitive tracking
-            results = process_zarr_dataset_kalman(
+            # Run tracking with velocity-based motion prediction
+            results = process_zarr_dataset_velocity(
                 zarr_path, 
                 threshold=0.5, 
                 min_distance=5
