@@ -1,11 +1,6 @@
-streamlit>=1.28.0
-torch>=2.0.0
 numpy>=1.24.0
 pandas>=2.0.0
-matplotlib>=3.7.0
 scipy>=1.10.0
 zarr>=2.14.0
 dask>=2023.5.0
-plotly>=5.14.0
 networkx>=3.1
-scikit-image>=0.21.0

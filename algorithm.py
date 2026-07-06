@@ -33,8 +33,13 @@ import networkx as nx
 # ============================================================================
 # Kaggle Environment Configuration
 # ============================================================================
-INPUT_DIR = "/kaggle/input/biohub-cell-tracking-during-development/test"
-OUTPUT_PATH = "submission.csv"
+# Detect if running in Kaggle environment or local data folder
+if os.path.exists('/kaggle/input'):
+    INPUT_DIR = "/kaggle/input/biohub-cell-tracking-during-development/test"
+    OUTPUT_PATH = "submission.csv"
+else:
+    INPUT_DIR = "./data/test"  # fallback for local dry-runs
+    OUTPUT_PATH = "./submission.csv"
 
 # Physical voxel dimensions in micrometers (µm)
 VOXEL_SIZE_Z = 1.625  # Z-axis: 1.625 µm/voxel
@@ -968,9 +973,6 @@ def main():
     if not zarr_files:
         print(f"[ERROR] No zarr files found in {INPUT_DIR}")
         return
-    
-    print(f"[INFO] Found {len(zarr_files)} datasets to process")
-    print()
     
     # Process each dataset sequentially
     for idx, zarr_file in enumerate(zarr_files):
